@@ -65,7 +65,7 @@ if not args.skip_featurise:
         f = f.join(owner, on="io", how="left").with_columns(
             (pl.col("i1") == pl.col("owner")).fill_null(False).alias("y"),
             (pl.coalesce("owner", "io").hash(seed=5) % args.val_mod == 0).alias("val"))
-        hard = (pl.col("rank_combo") <= 3) | (pl.col("rank_block") <= 3)
+        hard = (pl.col("rank_combo") <= 2) | (pl.col("rank_block") <= 2)
         keep_easy = (pl.struct("io", "i1").hash(seed=11) % args.easy_every == 0)
         f = (f.filter(pl.col("val") | pl.col("y") | hard | keep_easy)
               .with_columns(pl.when(pl.col("val") | pl.col("y") | hard).then(1.0)
@@ -83,6 +83,7 @@ parts = sorted(glob.glob(f"{feat_dir}/part_*.parquet"))
 # Fill one preallocated float32 matrix part by part (collecting then converting would
 # briefly hold two copies of the ~several-GB training matrix).
 counts = [pl.scan_parquet(p).filter(~pl.col("val")).select(pl.len()).collect().item() for p in parts]
+log(f"training matrix: {sum(counts):,} rows = {sum(counts) * len(FEATURES) * 4 / 1e9:.1f} GB")
 X = np.empty((sum(counts), len(FEATURES)), dtype=np.float32)
 y = np.empty(sum(counts), dtype=np.float32)
 w = np.empty(sum(counts), dtype=np.float32)
@@ -102,6 +103,7 @@ va = pl.scan_parquet(parts).filter(pl.col("val")).select(["io", "i1", "y"] + FEA
 Xv = va.select(FEATURES).to_numpy()
 dval = lgb.Dataset(Xv, va["y"].to_numpy(), reference=dtrain)
 log(f"validation rows {va.height:,} (positives {int(va['y'].sum()):,})")
+va = va.select("io", "i1")
 
 params = dict(objective="binary", learning_rate=args.lr, num_leaves=127, min_data_in_leaf=100,
               feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, verbose=-1)
