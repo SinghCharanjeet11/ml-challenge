@@ -1,0 +1,129 @@
+"""Train the matcher on the complete training split.
+
+Run `python block_split.py train` first (it caches the prepared frames and candidates).
+
+1. Featurise every candidate pair of every training record, chunk by chunk, writing the
+   chunks to parquet so the full feature table (~20 GB) never sits in memory.
+   - Validation: 10% of Source 1 entities (with all their records) and 10% of the
+     unmatched records keep every pair.
+   - Training (the other 90%): keep every positive and every hard negative (top-3 by
+     name+address score or by blocking score for its record); keep a random 1/`easy_every`
+     of the remaining easy negatives with weight `easy_every`, so the loss stays unbiased.
+2. Free the raw data, train LightGBM with early stopping on the validation pairs.
+3. Sweep the threshold on exact macro F0.5 over the validation entities and save
+   work/model.txt + work/config.json (the same files predict.py reads).
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+
+import lightgbm as lgb
+import numpy as np
+import polars as pl
+
+from decide import assign
+from features import FEATURES
+from io_utils import gt_pairs, load_split
+from metric import macro_f05
+from pipeline import block_cached, featurise_chunks, log, prep_cached
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--data", default="../../../dataset/student_resource/dataset")
+ap.add_argument("--work", default="../../../work")
+ap.add_argument("--keep_k", type=int, default=10)
+ap.add_argument("--val_mod", type=int, default=10, help="1/val_mod of entities held out for validation")
+ap.add_argument("--easy_every", type=int, default=10, help="keep 1 in N easy negatives (weight N)")
+ap.add_argument("--rounds", type=int, default=2000)
+ap.add_argument("--lr", type=float, default=0.05)
+ap.add_argument("--skip_featurise", action="store_true", help="reuse work/feat_full/ from a previous run")
+args = ap.parse_args()
+feat_dir = f"{args.work}/feat_full"
+
+# Source 1 id tables are needed for scoring after the raw frames are freed.
+nd = pl.read_parquet(f"{args.work}/name_dict.parquet")
+ad = pl.read_parquet(f"{args.work}/addr_dict.parquet")
+s1p, op = prep_cached(args.work, "train", None, nd, ad)
+s1ids = s1p.select("i1", pl.col("entity_id").alias("s1_id"))
+oids = op.select("io", pl.col("entity_id").alias("o_id"))
+_, _, gt = load_split(args.data, "train")
+pairs = gt_pairs(gt)
+del gt
+owner = (pairs.join(s1ids, on="s1_id").join(oids, on="o_id")
+              .select("io", pl.col("i1").alias("owner")))
+val_s1 = s1ids.filter(pl.col("i1").hash(seed=5) % args.val_mod == 0)
+log(f"train: s1={s1p.height:,} others={op.height:,} links={owner.height:,} val entities={val_s1.height:,}")
+
+if not args.skip_featurise:
+    cand = block_cached(args.work, "train")
+    log(f"candidates: {cand.height:,}")
+    shutil.rmtree(feat_dir, ignore_errors=True)
+    os.makedirs(feat_dir)
+    n_kept = 0
+    for n, f in enumerate(featurise_chunks(cand, s1p, op, keep_k=args.keep_k)):
+        f = f.join(owner, on="io", how="left").with_columns(
+            (pl.col("i1") == pl.col("owner")).fill_null(False).alias("y"),
+            (pl.coalesce("owner", "io").hash(seed=5) % args.val_mod == 0).alias("val"))
+        hard = (pl.col("rank_combo") <= 3) | (pl.col("rank_block") <= 3)
+        keep_easy = (pl.struct("io", "i1").hash(seed=11) % args.easy_every == 0)
+        f = (f.filter(pl.col("val") | pl.col("y") | hard | keep_easy)
+              .with_columns(pl.when(pl.col("val") | pl.col("y") | hard).then(1.0)
+                              .otherwise(float(args.easy_every)).cast(pl.Float32).alias("w"))
+              .drop("owner"))
+        f.write_parquet(f"{feat_dir}/part_{n:04d}.parquet")
+        n_kept += f.height
+        if n % 5 == 0:
+            log(f"featurised chunk {n}: {n_kept:,} rows written")
+    del cand
+    log(f"featurised: {n_kept:,} rows written to {feat_dir}")
+del s1p, op
+
+parts = sorted(glob.glob(f"{feat_dir}/part_*.parquet"))
+# Fill one preallocated float32 matrix part by part (collecting then converting would
+# briefly hold two copies of the ~several-GB training matrix).
+counts = [pl.scan_parquet(p).filter(~pl.col("val")).select(pl.len()).collect().item() for p in parts]
+X = np.empty((sum(counts), len(FEATURES)), dtype=np.float32)
+y = np.empty(sum(counts), dtype=np.float32)
+w = np.empty(sum(counts), dtype=np.float32)
+at = 0
+for p, c in zip(parts, counts):
+    d = pl.read_parquet(p).filter(~pl.col("val"))
+    X[at:at + c] = d.select(FEATURES).to_numpy()
+    y[at:at + c] = d["y"].to_numpy()
+    w[at:at + c] = d["w"].to_numpy()
+    at += c
+log(f"training rows {len(y):,} (positives {int(y.sum()):,}, weighted size {w.sum():,.0f})")
+dtrain = lgb.Dataset(X, y, weight=w, free_raw_data=True)
+dtrain.construct()
+del X, y, w
+
+va = pl.scan_parquet(parts).filter(pl.col("val")).select(["io", "i1", "y"] + FEATURES).collect()
+Xv = va.select(FEATURES).to_numpy()
+dval = lgb.Dataset(Xv, va["y"].to_numpy(), reference=dtrain)
+log(f"validation rows {va.height:,} (positives {int(va['y'].sum()):,})")
+
+params = dict(objective="binary", learning_rate=args.lr, num_leaves=127, min_data_in_leaf=100,
+              feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, verbose=-1)
+booster = lgb.train(params, dtrain, num_boost_round=args.rounds, valid_sets=[dval],
+                    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)])
+log(f"trained {booster.best_iteration} rounds")
+
+scored = va.select("io", "i1").with_columns(
+    pl.Series("p", booster.predict(Xv, num_iteration=booster.best_iteration)))
+del Xv, dval
+val_ids = val_s1["s1_id"]
+owned = pairs.filter(pl.col("s1_id").is_in(val_ids.implode()))
+best = (0.0, 0.5)
+for tau in (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5):
+    pred = assign(scored, tau).join(s1ids, on="i1").join(oids, on="io").select("s1_id", "o_id")
+    f = macro_f05(val_ids.to_list(), pred, owned)
+    log(f"tau={tau:.2f} macroF0.5={f:.5f} pairs={pred.height:,}")
+    best = max(best, (f, tau))
+log(f"BEST tau={best[1]} F0.5={best[0]:.5f}")
+
+booster.save_model(f"{args.work}/model.txt", num_iteration=booster.best_iteration)
+json.dump({"tau": best[1], "keep_k": args.keep_k, "val_f05": best[0], "trained_on": "full"},
+          open(f"{args.work}/config.json", "w"))
+imp = sorted(zip(booster.feature_importance("gain"), FEATURES), reverse=True)[:12]
+log("saved model; top features: " + ", ".join(n for _, n in imp))

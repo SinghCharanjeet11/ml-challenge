@@ -1,0 +1,263 @@
+{
+ "files": {
+  "train_s1": {
+   "rows": 2206821,
+   "malformed_rows": 0,
+   "country": {
+    "US": 1323633,
+    "India": 883188
+   },
+   "missing_name": {},
+   "missing_addr": {},
+   "devanagari": {},
+   "non_ascii": {
+    "India": 554
+   },
+   "india_6digit_pin": {},
+   "us_trailing_zip": {
+    "US": 81
+   },
+   "fr_5digit": {},
+   "name_len_median": 24.0,
+   "addr_len_median": 41.0
+  },
+  "train_s2": {
+   "rows": 5034616,
+   "malformed_rows": 0,
+   "country": {
+    "India": 2017799,
+    "US": 3016817
+   },
+   "missing_name": {},
+   "missing_addr": {
+    "US": 111121,
+    "India": 57846
+   },
+   "devanagari": {
+    "India": 479500
+   },
+   "non_ascii": {
+    "India": 904496,
+    "US": 202224
+   },
+   "india_6digit_pin": {},
+   "us_trailing_zip": {
+    "US": 67
+   },
+   "fr_5digit": {},
+   "name_len_median": 25.0,
+   "addr_len_median": 37.0
+  },
+  "train_s3": {
+   "rows": 5285603,
+   "malformed_rows": 0,
+   "country": {
+    "US": 3170056,
+    "India": 2115547
+   },
+   "missing_name": {},
+   "missing_addr": {
+    "India": 64948,
+    "US": 110968
+   },
+   "devanagari": {
+    "India": 394374
+   },
+   "non_ascii": {
+    "US": 215616,
+    "India": 774056
+   },
+   "india_6digit_pin": {},
+   "us_trailing_zip": {
+    "US": 169
+   },
+   "fr_5digit": {},
+   "name_len_median": 25.0,
+   "addr_len_median": 42.0
+  },
+  "test_s1": {
+   "rows": 1732544,
+   "malformed_rows": 0,
+   "country": {
+    "US": 663106,
+    "France": 259452,
+    "India": 809986
+   },
+   "missing_name": {},
+   "missing_addr": {},
+   "devanagari": {},
+   "non_ascii": {
+    "France": 101001,
+    "India": 465
+   },
+   "india_6digit_pin": {},
+   "us_trailing_zip": {
+    "US": 44
+   },
+   "fr_5digit": {
+    "France": 1005
+   },
+   "name_len_median": 24.0,
+   "addr_len_median": 50.0
+  },
+  "test_s2": {
+   "rows": 4887273,
+   "malformed_rows": 0,
+   "country": {
+    "India": 2312565,
+    "France": 703378,
+    "US": 1871330
+   },
+   "missing_name": {},
+   "missing_addr": {
+    "India": 52764,
+    "US": 55107,
+    "France": 21537
+   },
+   "devanagari": {
+    "India": 550530
+   },
+   "non_ascii": {
+    "France": 298234,
+    "India": 1035445,
+    "US": 116966
+   },
+   "india_6digit_pin": {},
+   "us_trailing_zip": {
+    "US": 42
+   },
+   "fr_5digit": {
+    "France": 3486
+   },
+   "name_len_median": 25.0,
+   "addr_len_median": 43.0
+  },
+  "test_s3": {
+   "rows": 5082316,
+   "malformed_rows": 0,
+   "country": {
+    "India": 2405000,
+    "France": 731615,
+    "US": 1945701
+   },
+   "missing_name": {},
+   "missing_addr": {
+    "France": 21541,
+    "India": 59240,
+    "US": 55317
+   },
+   "devanagari": {
+    "India": 454885
+   },
+   "non_ascii": {
+    "India": 883840,
+    "France": 308358,
+    "US": 124460
+   },
+   "india_6digit_pin": {},
+   "us_trailing_zip": {
+    "US": 98
+   },
+   "fr_5digit": {
+    "France": 3742
+   },
+   "name_len_median": 25.0,
+   "addr_len_median": 43.0
+  }
+ },
+ "id_overlap": {
+  "s1": {
+   "train_unique": 2206821,
+   "test_unique": 1732544,
+   "overlap": 0,
+   "train_dupe_ids": 0,
+   "test_dupe_ids": 0
+  },
+  "s2": {
+   "train_unique": 5034616,
+   "test_unique": 4887273,
+   "overlap": 0,
+   "train_dupe_ids": 0,
+   "test_dupe_ids": 0
+  },
+  "s3": {
+   "train_unique": 5285603,
+   "test_unique": 5082316,
+   "overlap": 0,
+   "train_dupe_ids": 0,
+   "test_dupe_ids": 0
+  }
+ },
+ "gt": {
+  "k_hist": {
+   "0": 123247,
+   "1": 119157,
+   "2": 375212,
+   "3": 530841,
+   "4": 484115,
+   "5": 321957,
+   "6": 164868,
+   "7": 63968,
+   "8": 18680,
+   "9": 4205,
+   "10": 534,
+   "11": 37
+  },
+  "k_by_country": {
+   "US": {
+    "0": 73896,
+    "1": 71689,
+    "2": 225285,
+    "3": 318876,
+    "4": 290446,
+    "5": 192618,
+    "6": 98406,
+    "7": 38299,
+    "8": 11217,
+    "9": 2534,
+    "10": 347,
+    "11": 20
+   },
+   "India": {
+    "0": 49351,
+    "1": 47468,
+    "2": 149927,
+    "3": 211965,
+    "4": 193669,
+    "5": 129339,
+    "6": 66462,
+    "7": 25669,
+    "8": 7463,
+    "9": 1671,
+    "10": 187,
+    "11": 17
+   }
+  },
+  "s2_per_s1": {
+   "0": 287745,
+   "1": 789108,
+   "2": 652779,
+   "3": 333957,
+   "4": 119078,
+   "5": 24154
+  },
+  "s3_per_s1": {
+   "0": 266276,
+   "1": 716417,
+   "2": 668375,
+   "3": 372443,
+   "4": 145116,
+   "5": 35378,
+   "6": 2816
+  },
+  "total_links": 7638365,
+  "distinct_matched_ids": 7638365,
+  "times_an_id_is_matched": {
+   "1": 7638365
+  },
+  "cross_country_links": 0,
+  "links_to_missing_ids": 0,
+  "s2_matched_frac": 0.7336446314872872,
+  "s3_matched_frac": 0.7463190103380826
+ }
+}
