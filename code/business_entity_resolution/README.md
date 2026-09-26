@@ -43,5 +43,6 @@ python utils/validate_submission.py --matching ../../output/matching_results.tsv
 
 ## Results
 
-- 12% training sample, 2-fold out-of-fold: macro F0.5 = 0.9878 at tau = 0.25.
+- Full training data (`train_full.py`), 10% entity holdout: macro F0.5 = 0.9888 at tau = 0.20.
+- 12% training sample (`train.py`), 2-fold out-of-fold: macro F0.5 = 0.9878 at tau = 0.25.
 - Blocking: 102.5M train / 99.0M test candidate pairs (top-10 per record).
