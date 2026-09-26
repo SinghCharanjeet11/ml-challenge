@@ -1,8 +1,6 @@
-"""Run the trained pipeline on the test split and write both submission files.
+"""Score the test candidates with the saved model and write both output TSVs.
 
-Outputs (tab-separated, LF line endings, one row per test Source 1 entity):
-  output/candidate_pairs.tsv  - the exact candidate set the model scores (top-K per record)
-  output/matching_results.tsv - final matches after assignment + threshold
+Run block_split.py test first.
 """
 import argparse
 import json
@@ -11,7 +9,7 @@ import lightgbm as lgb
 import polars as pl
 
 from decide import assign
-from features import FEATURES
+from features import FEATURES_V1
 from io_utils import load_split, write_id_lists_chunked
 from pipeline import block_cached, featurise_chunks, log, prep_cached
 
@@ -29,7 +27,8 @@ ad = pl.read_parquet(f"{args.work}/addr_dict.parquet")
 booster = lgb.Booster(model_file=f"{args.work}/model.txt")
 
 prep_cached(args.work, "test", lambda: load_split(args.data, "test")[:2], nd, ad)
-cand = block_cached(args.work, "test")
+cand = block_cached(args.work, "test", cfg.get("blocking", "v1"))
+FEATURES = cfg.get("features", FEATURES_V1)
 s1p, op = prep_cached(args.work, "test", None, nd, ad)
 log(f"test: s1={s1p.height:,} others={op.height:,} countries={sorted(s1p['country'].unique().to_list())}")
 log(f"candidates: {cand.height:,}")

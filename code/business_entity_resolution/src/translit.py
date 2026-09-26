@@ -1,9 +1,8 @@
-"""Indic-script -> Latin token dictionary learned from matched training pairs.
+"""Indic -> Latin word dictionary learned from the train matches.
 
-Source 2/3 often render an English business name phonetically in an Indian script,
-word by word (e.g. "Modern Agro Private Limited" -> four Gujarati words). For matched
-pairs whose names have the same number of words, words are aligned by position and the
-most frequent Latin counterpart of each Indic word becomes its translation.
+S2/S3 often write an English name phonetically in an Indian script, word for word
+("Modern Agro Private Limited" -> 4 Gujarati words). When both names have the same number of
+words we line them up by position and keep the most common Latin word for each Indic word.
 """
 import polars as pl
 
@@ -16,10 +15,7 @@ def _words(col):
 
 
 def learn_dictionary(s1, others, pairs, min_count=2, min_share=0.5):
-    """Return a DataFrame (src_tok, dst_tok) mapping Indic words to Latin words.
-
-    `pairs` holds (s1_id, o_id) training matches.
-    """
+    """(src_tok, dst_tok) table: Indic word -> Latin word."""
     p = (pairs.join(s1.select(pl.col("entity_id").alias("s1_id"), pl.col("business_name").alias("n1")), on="s1_id")
               .join(others.select(pl.col("entity_id").alias("o_id"), pl.col("business_name").alias("n2")), on="o_id")
               .filter(pl.col("n2").str.contains(INDIC))
@@ -63,7 +59,7 @@ def transliterate_addresses(df, dictionary, col="business_address", out="addr_la
 
 
 def transliterate_names(df, dictionary, col="business_name", out="name_lat"):
-    """Add `out`: `col` with every Indic word replaced by its learned Latin word (unknown words kept)."""
+    """Replace known Indic words in `col` with their Latin form; unknown words are kept."""
     words = (df.select(pl.int_range(pl.len()).alias("_r"), _words(col).alias("w"))
                .with_columns(pl.col("w").list.eval(pl.element()).alias("w"))
                .explode("w").with_row_index("_o"))

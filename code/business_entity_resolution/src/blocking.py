@@ -1,10 +1,8 @@
-"""Candidate generation: every Source 2/3 record retrieves its top-K Source 1 records.
+"""Blocking: each S2/S3 record pulls its top-k S1 candidates (same country only).
 
-Records are indexed by hashed keys: single name tokens, name-token pairs (order-free),
-a concatenated core name, address tokens, adjacent address bigrams, and name-token x
-address-token combinations. Keys are only compared within the same country label, keys
-that are too common on the Source 1 side are skipped, and each candidate is scored by the
-summed IDF of the keys it shares with the query.
+Keys = name tokens, name token pairs, joined name, address tokens, address bigrams and
+name x address combos, all hashed. Very common keys are dropped and candidates are
+ranked by the summed IDF of the keys they share with the query.
 """
 import polars as pl
 
@@ -15,9 +13,7 @@ MAX_ADDR_TOKENS = 10
 
 
 def record_keys(df, id_col, slice_rows=250_000):
-    """Long table (id, key:u64) of hashed blocking keys; `df` must have nm/ad columns.
-
-    Built in slices so the intermediate string-key tables stay small."""
+    """Hashed blocking keys as a long (id, key) table. Built in slices to keep memory down."""
     return pl.concat([_record_keys(df.slice(s, slice_rows), id_col)
                       for s in range(0, max(df.height, 1), slice_rows)])
 
@@ -83,11 +79,7 @@ def _candidates_one_country(usable, k1, ko, top_k, max_keys, budget, chunk_rows)
 
 def generate_candidates(s1, others, top_k=20, df_cap=2000, max_keys=24, budget=20_000,
                         chunk_rows=60_000_000, query_chunk=1_000_000, verbose=True):
-    """Return (io, i1, block_score, n_shared) candidate pairs using integer row ids.
-
-    Runs one country label at a time (whatever labels exist in the data); queries are
-    processed in chunks of `query_chunk` records against a Source 1 index built once.
-    """
+    """(io, i1, block_score, n_shared) pairs, one country at a time, queries in chunks."""
     out = []
     for country in s1["country"].unique().sort().to_list():
         a = s1.filter(pl.col("country") == country)

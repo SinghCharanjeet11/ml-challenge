@@ -1,13 +1,11 @@
-"""Macro-averaged per-entity F0.5, exactly as the challenge defines it."""
+"""Macro F0.5 per S1 entity, same as the leaderboard."""
 import polars as pl
 
 
 def macro_f05(s1_ids, pred_pairs, true_pairs):
-    """Score predictions.
+    """pred_pairs / true_pairs have columns (s1_id, o_id).
 
-    s1_ids: sequence of every Source 1 id being evaluated.
-    pred_pairs / true_pairs: DataFrames with columns (s1_id, o_id).
-    Truth empty + prediction empty scores 1.0; any other case with an empty side scores 0.0.
+    Empty truth + empty prediction = 1.0, one side empty = 0.0.
     """
     base = pl.DataFrame({"s1_id": pl.Series(s1_ids, dtype=pl.String)})
     pred = pred_pairs.select("s1_id", "o_id").unique()

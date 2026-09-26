@@ -1,4 +1,4 @@
-"""Shared preparation steps: load a split, transliterate, normalise, block, featurise."""
+"""Shared steps used by train and predict: prep, cached blocking, featurising."""
 import os
 import time
 
@@ -13,6 +13,9 @@ from translit import learn_address_dictionary, learn_dictionary, transliterate_a
 
 BLOCK_PARAMS = dict(top_k=10, df_cap=1000, max_keys=24, budget=10_000, query_chunk=250_000,
                     chunk_rows=5_000_000)
+# v2 blocking = key blocking with a bigger top_k + the char 3-gram tfidf pass (needs more RAM).
+V2_KEY_TOPK = 20
+V2_TFIDF_TOPN = 10
 # Columns kept after preparation (everything else is dropped to save memory).
 KEEP_S1 = ["i1", "entity_id", "country", "nm", "ad", "core", "legal", "adc", "nums", "num0"]
 KEEP_O = KEEP_S1[1:] + ["io", "src", "indic", "webname", "alias"]
@@ -42,21 +45,19 @@ def prep_records(s1, oth, name_dict, addr_dict):
 
 
 def top_k_with_s1_context(cand, keep_k):
-    """Keep each query's top `keep_k` candidates and add Source-1-side context computed over
-    the complete candidate table (so it does not depend on chunking or sampling)."""
-    cand = (cand.sort(["io", "block_score"], descending=[False, True])
-                .group_by("io", maintain_order=True).head(keep_k))
+    """Top keep_k per query + S1-side context over the whole candidate table (so it doesn't
+    depend on sampling or chunking).
+    """
+    if keep_k:
+        cand = (cand.sort(["io", "block_score"], descending=[False, True])
+                    .group_by("io", maintain_order=True).head(keep_k))
     return cand.with_columns(
         pl.len().over("i1").alias("n_cand_1"),
         pl.col("block_score").rank("ordinal", descending=True).over("i1").alias("rank_block_1"))
 
 
 def featurise_chunks(cand, s1p, op, keep_k=10, chunk_queries=400_000, queries=None):
-    """Yield feature frames for each query's top `keep_k` candidates, one chunk of queries at a time.
-
-    `queries` optionally restricts featurisation to a subset of query ids (training samples).
-    Candidates are sorted by query, so each chunk is a contiguous slice.
-    """
+    """Yields feature frames ~400k queries at a time. `queries` limits it to a subset."""
     cand = top_k_with_s1_context(cand, keep_k)
     if queries is not None:
         cand = cand.filter(pl.col("io").is_in(queries.implode()))
@@ -70,12 +71,11 @@ def featurise_chunks(cand, s1p, op, keep_k=10, chunk_queries=400_000, queries=No
 
 
 def featurise(cand, s1p, op, keep_k=10, chunk_queries=400_000, queries=None):
-    """All feature chunks from featurise_chunks, concatenated."""
     return pl.concat(featurise_chunks(cand, s1p, op, keep_k, chunk_queries, queries))
 
 
 def prep_cached(work, split, load, name_dict, addr_dict):
-    """prep_records with the result cached as parquet in `work`."""
+    """prep_records, cached as parquet in work/."""
     p1, po = f"{work}/{split}_s1p.parquet", f"{work}/{split}_op.parquet"
     if not (os.path.exists(p1) and os.path.exists(po)):
         s1, oth = load()
@@ -87,14 +87,25 @@ def prep_cached(work, split, load, name_dict, addr_dict):
     return pl.read_parquet(p1), pl.read_parquet(po)
 
 
-def block_cached(work, split):
-    """Candidate pairs for a split whose prepared frames were cached by prep_cached.
+def block_cached(work, split, version="v1"):
+    """Load (or build) the candidates for a prepared split. Only loads the columns blocking needs.
 
-    Only the columns blocking needs are loaded, so the rest stay out of memory."""
-    path = f"{work}/{split}_cand.parquet"
+    v1: key blocking top 10. v2: key blocking top V2_KEY_TOPK merged with the tfidf top
+    V2_TFIDF_TOPN (pairs found by only one pass get 0 for the other pass's score).
+    """
+    path = f"{work}/{split}_cand.parquet" if version == "v1" else f"{work}/{split}_cand_{version}.parquet"
     if not os.path.exists(path):
         cols = ["country", "nm", "ad"]
-        s1n = pl.read_parquet(f"{work}/{split}_s1p.parquet", columns=["i1"] + cols)
-        on = pl.read_parquet(f"{work}/{split}_op.parquet", columns=["io"] + cols)
-        generate_candidates(s1n, on, **BLOCK_PARAMS).write_parquet(path)
+        s1n = pl.read_parquet(f"{work}/{split}_s1p.parquet", columns=["i1"] + cols + ["core"])
+        on = pl.read_parquet(f"{work}/{split}_op.parquet", columns=["io"] + cols + ["core"])
+        if version == "v1":
+            cand = generate_candidates(s1n, on, **BLOCK_PARAMS)
+        else:
+            from tfidf_blocking import tfidf_candidates
+            keys = generate_candidates(s1n, on, **{**BLOCK_PARAMS, "top_k": V2_KEY_TOPK})
+            tf = tfidf_candidates(s1n, on, top_n=V2_TFIDF_TOPN)
+            cand = (keys.join(tf, on=["io", "i1"], how="full", coalesce=True)
+                        .with_columns(pl.col("block_score").fill_null(0.0), pl.col("n_shared").fill_null(0),
+                                      pl.col("tfidf_sim").fill_null(0.0)))
+        cand.write_parquet(path)
     return pl.read_parquet(path)

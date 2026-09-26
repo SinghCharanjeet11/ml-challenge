@@ -1,12 +1,8 @@
-"""Train the matcher on the training split and measure out-of-fold macro F0.5.
+"""Quick training run on a sample of the train entities (--frac).
 
-1. Prepare and block the *full* training split (all Source 2/3 records), exactly as the test
-   run will, so candidate-context features have the same distribution at train and test time.
-2. Sample a fraction of Source 1 entities with all of their Source 2/3 records, plus the same
-   fraction of unmatched records, and featurise their candidates.
-3. 2-fold LightGBM (folds by owning entity) gives out-of-fold probabilities; sweep the
-   threshold on exact macro F0.5 and print an error breakdown.
-4. Refit on all sampled pairs and save the model + chosen threshold.
+Uses the full candidate table from block_split.py so the rank/context features look the
+same as on test. 2 folds split by owner entity give out-of-fold scores for the tau sweep,
+then we refit on the whole sample and save work/model.txt + config.json.
 """
 import argparse
 import json
