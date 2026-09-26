@@ -1,4 +1,4 @@
-"""Text normalisation and tokenisation, expressed as polars operations."""
+"""Text cleaning / tokenising (polars expressions)."""
 import polars as pl
 
 # Street / address words -> canonical short form (applied per token).

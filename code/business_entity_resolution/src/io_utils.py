@@ -1,14 +1,14 @@
-"""Loading source files and writing submission files."""
+"""Reading the TSVs and writing the submission files."""
 import os
 
 import polars as pl
 
 
 def read_tsv(path):
-    """Read a challenge TSV with every column as a string.
+    """Read a TSV as all-string columns.
 
-    Quote handling is off (some names contain literal quote characters) and empty
-    fields stay as empty strings, so "NA" or "null" business names survive intact.
+    Quoting is off because some names contain a literal quote, and NA/null names must stay
+    as text.
     """
     df = pl.read_csv(path, separator="\t", quote_char=None, infer_schema=False)
     df = df.with_columns(pl.all().fill_null(""))
@@ -19,10 +19,7 @@ def read_tsv(path):
 
 
 def load_split(data_dir, split):
-    """Return (s1, others, ground_truth or None) for 'train' or 'test'.
-
-    `others` stacks Source 2 and Source 3 with an integer `src` column.
-    """
+    """(s1, s2+s3 stacked with a `src` column, ground truth or None)"""
     d = os.path.join(data_dir, split)
     s1 = read_tsv(os.path.join(d, f"{split}_source1.tsv"))
     s2 = read_tsv(os.path.join(d, f"{split}_source2.tsv")).with_columns(pl.lit(2, pl.Int8).alias("src"))
@@ -53,11 +50,8 @@ def write_id_lists(path, s1_ids, pairs, id_col, header_col):
 
 
 def write_id_lists_chunked(path, s1_ids, pairs, o_ids, header_col, chunk=200_000):
-    """Low-memory write_id_lists for integer-id pairs.
-
-    s1_ids: (i1, s1_id) in output order with i1 = row number; pairs: (i1, io);
-    o_ids: (io, o_id). Rows are written in slices of `chunk` Source 1 entities so only one
-    slice of pairs is ever joined to its string ids.
+    """Same output as write_id_lists but for integer ids, written 200k S1 rows at a time
+    (joining all ~100M candidate pairs to their string ids at once needs too much RAM).
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     pairs = pairs.select("i1", "io").sort("i1")

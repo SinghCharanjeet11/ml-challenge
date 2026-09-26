@@ -1,8 +1,7 @@
-"""Prepare and block one split in its own process, caching the results in `work`.
+"""Prep + block one split ("train" or "test") and cache everything in work/.
 
-Blocking is the memory peak of the pipeline, so it runs before train.py / predict.py
-(which then load the cached frames) rather than alongside their other data.
-Needs work/name_dict.parquet and work/addr_dict.parquet (written by learn_dicts below).
+Blocking is the most memory hungry step, so we run it on its own before train/predict.
+Learns the translit dicts first if work/ doesn't have them yet.
 """
 import argparse
 import os
@@ -16,6 +15,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("split", choices=["train", "test"])
 ap.add_argument("--data", default="../../../dataset/student_resource/dataset")
 ap.add_argument("--work", default="../../../work")
+ap.add_argument("--blocking", default="v1", choices=["v1", "v2"])
 args = ap.parse_args()
 os.makedirs(args.work, exist_ok=True)
 
@@ -27,5 +27,5 @@ if not (os.path.exists(nd_path) and os.path.exists(ad_path)):
 nd, ad = pl.read_parquet(nd_path), pl.read_parquet(ad_path)
 prep_cached(args.work, args.split, lambda: load_split(args.data, args.split)[:2], nd, ad)
 log("prepared")
-cand = block_cached(args.work, args.split)
+cand = block_cached(args.work, args.split, args.blocking)
 log(f"{args.split} candidates: {cand.height:,}")

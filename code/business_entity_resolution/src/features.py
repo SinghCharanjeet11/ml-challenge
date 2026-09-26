@@ -1,4 +1,4 @@
-"""Pairwise features for (Source 2/3 record, Source 1 candidate) pairs."""
+"""Pair features for (S2/S3 record, S1 candidate)."""
 import numpy as np
 import polars as pl
 from rapidfuzz import distance, fuzz, process
@@ -42,6 +42,8 @@ def build_features(cand, s1p, op):
     """cand: (io, i1, block_score, n_shared, n_cand_1, rank_block_1). s1p/op: prepared frames."""
     s1_cols = ["i1", "nm", "core", "legal", "adc", "nums", "num0"]
     o_cols = ["io", "nm", "core", "legal", "adc", "nums", "num0", "src", "indic", "webname", "alias"]
+    if "tfidf_sim" not in cand.columns:
+        cand = cand.with_columns(pl.lit(0.0, pl.Float32).alias("tfidf_sim"))
     df = (cand.join(op.select(o_cols), on="io")
               .join(s1p.select(s1_cols), on="i1", suffix="_1"))
 
@@ -135,3 +137,6 @@ FEATURES = [
     "rank_block_1", "margin_2nd", "hn0_logdiff", "hn_min_logdiff", "hn_near", "hn0_prefix",
     "extra_tok_o", "extra_tok_1", "extra_all_o", "extra_all_1",
 ]
+# v2 blocking adds the tfidf similarity. Models trained on v1 candidates use FEATURES_V1.
+FEATURES_V1 = list(FEATURES)
+FEATURES = FEATURES_V1 + ["tfidf_sim"]

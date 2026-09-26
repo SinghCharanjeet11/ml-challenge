@@ -1,17 +1,9 @@
-"""Train the matcher on the complete training split.
+"""Train on all training entities.
 
-Run `python block_split.py train` first (it caches the prepared frames and candidates).
-
-1. Featurise every candidate pair of every training record, chunk by chunk, writing the
-   chunks to parquet so the full feature table (~20 GB) never sits in memory.
-   - Validation: 10% of Source 1 entities (with all their records) and 10% of the
-     unmatched records keep every pair.
-   - Training (the other 90%): keep every positive and every hard negative (top-3 by
-     name+address score or by blocking score for its record); keep a random 1/`easy_every`
-     of the remaining easy negatives with weight `easy_every`, so the loss stays unbiased.
-2. Free the raw data, train LightGBM with early stopping on the validation pairs.
-3. Sweep the threshold on exact macro F0.5 over the validation entities and save
-   work/model.txt + work/config.json (the same files predict.py reads).
+The full feature table is ~20 GB, so features are written to work/feat_full/ chunk by chunk.
+10% of entities are held out (all their pairs) for early stopping and the tau sweep. For the
+other 90% we keep positives + top-2 hard negatives and 1 in `easy_every` easy negatives
+with weight `easy_every`.
 """
 import argparse
 import glob
@@ -24,7 +16,7 @@ import numpy as np
 import polars as pl
 
 from decide import assign
-from features import FEATURES
+from features import FEATURES, FEATURES_V1
 from io_utils import gt_pairs, load_split
 from metric import macro_f05
 from pipeline import block_cached, featurise_chunks, log, prep_cached
@@ -32,14 +24,17 @@ from pipeline import block_cached, featurise_chunks, log, prep_cached
 ap = argparse.ArgumentParser()
 ap.add_argument("--data", default="../../../dataset/student_resource/dataset")
 ap.add_argument("--work", default="../../../work")
-ap.add_argument("--keep_k", type=int, default=10)
+ap.add_argument("--keep_k", type=int, default=10, help="0 = keep every candidate")
+ap.add_argument("--blocking", default="v1", choices=["v1", "v2"])
 ap.add_argument("--val_mod", type=int, default=10, help="1/val_mod of entities held out for validation")
 ap.add_argument("--easy_every", type=int, default=10, help="keep 1 in N easy negatives (weight N)")
 ap.add_argument("--rounds", type=int, default=2000)
 ap.add_argument("--lr", type=float, default=0.05)
 ap.add_argument("--skip_featurise", action="store_true", help="reuse work/feat_full/ from a previous run")
 args = ap.parse_args()
-feat_dir = f"{args.work}/feat_full"
+feat_dir = f"{args.work}/feat_full" if args.blocking == "v1" else f"{args.work}/feat_full_{args.blocking}"
+if args.blocking == "v1":
+    FEATURES = FEATURES_V1
 
 # Source 1 id tables are needed for scoring after the raw frames are freed.
 nd = pl.read_parquet(f"{args.work}/name_dict.parquet")
@@ -56,7 +51,7 @@ val_s1 = s1ids.filter(pl.col("i1").hash(seed=5) % args.val_mod == 0)
 log(f"train: s1={s1p.height:,} others={op.height:,} links={owner.height:,} val entities={val_s1.height:,}")
 
 if not args.skip_featurise:
-    cand = block_cached(args.work, "train")
+    cand = block_cached(args.work, "train", args.blocking)
     log(f"candidates: {cand.height:,}")
     shutil.rmtree(feat_dir, ignore_errors=True)
     os.makedirs(feat_dir)
@@ -125,7 +120,8 @@ for tau in (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5):
 log(f"BEST tau={best[1]} F0.5={best[0]:.5f}")
 
 booster.save_model(f"{args.work}/model.txt", num_iteration=booster.best_iteration)
-json.dump({"tau": best[1], "keep_k": args.keep_k, "val_f05": best[0], "trained_on": "full"},
+json.dump({"tau": best[1], "keep_k": args.keep_k, "val_f05": best[0], "trained_on": "full",
+           "blocking": args.blocking, "features": FEATURES},
           open(f"{args.work}/config.json", "w"))
 imp = sorted(zip(booster.feature_importance("gain"), FEATURES), reverse=True)[:12]
 log("saved model; top features: " + ", ".join(n for _, n in imp))

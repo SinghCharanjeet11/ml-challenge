@@ -5,3 +5,5 @@ output/
 .venv/
 __pycache__/
 *.pyc
+output_v1/
+*.zip

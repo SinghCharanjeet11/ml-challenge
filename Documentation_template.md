@@ -1,210 +1,225 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
+**Team Name:** bruteforce  
+**Team Members:** Charanjeet Singh, Vanshika Srivastava  
 **Submission Date:** 2026-09-26
 
 ---
 
 ## 1. Executive Summary
-Every Source 2 / Source 3 record retrieves its top-10 Source 1 candidates through IDF-scored, hashed
-name and address keys, blocked within each country label. A LightGBM classifier then scores each
-pair on 49 string, house-number and candidate-context features, and a decision layer gives every
-S2/S3 record at most one owner and applies an F0.5-tuned threshold. The main additions are a learned
-Indic-to-Latin word dictionary for the ~40% of Indian records written in Indic scripts, and
-house-number-distance and extra-word features that separate true matches from near-duplicate
-distractors. On a held-out 10% of training entities, macro F0.5 = **0.9888**.
+We use a classic blocking + classifier setup. Every Source 2/3 record looks up its 10 most
+likely Source 1 entities using hashed name/address keys (only within its own country), a
+LightGBM model scores those pairs, and each record is then given to at most one Source 1
+entity if the score is high enough. The two things that helped most were a small
+Indic-to-Latin word dictionary learned from the training matches, and features aimed at
+near-duplicate "distractor" records (house number distance, extra words in the name). Our
+best validation score is 0.9905 macro F0.5 on a 10% holdout of the training entities.
 
 ---
 
 ## 2. Methodology
 
 ### 2.1 Problem Analysis
-Findings from EDA over all train and test files (no ground truth used on test):
+Things we found while exploring the data that ended up shaping the pipeline:
 
-| Finding | Evidence | Consequence |
-|---|---|---|
-| Each S2/S3 record belongs to at most one S1 entity | 7,638,365 links, each ID matched exactly once | Search from the S2/S3 side; enforce one owner per record |
-| Links never cross country labels | 0 cross-country links | Block within each country (lossless) |
-| Many S1 entities have no match | 123,247 of 2.2M (5.6%) in train | A wrong match on a singleton turns 1.0 into 0.0, so precision matters |
-| About a quarter of S2/S3 records match nothing | S2 26.6%, S3 25.4% unmatched | Distractors everywhere: a similar name is not proof |
-| Indian S2/S3 names are often in Indic scripts | ~40% of Indian S2/S3 names, 9 scripts | Transliteration needed before comparing |
-| Postal codes are practically absent | India PIN: 0; US ZIP < 0.01% | Block on street, city and house number instead |
-| France appears only in test (15% of S1) | 259,452 French S1 entities | Rules must be language-agnostic; French address words added |
-| Parsing traps | Literal quote characters in names, "NA"/"null" names | Read with quoting and NA conversion disabled; row counts asserted |
-| Test pool is relatively larger | S2+S3 per S1: train 4.68, test 5.75 | Expect a slightly harder precision problem on test |
+- Every S2/S3 record is matched to at most one S1 entity (all 7.6M train links are unique),
+  so it made sense to search from the S2/S3 side and allow only one owner per record.
+- No link crosses countries, so blocking per country loses nothing.
+- 5.6% of S1 entities have no match, and roughly a quarter of S2/S3 records match nothing.
+  A wrong match on a no-match entity turns a 1.0 into a 0.0, so precision matters a lot, and
+  a similar name alone isn't enough evidence.
+- About 40% of Indian S2/S3 names are written in Indic scripts (9 different scripts), usually
+  as a word-by-word phonetic spelling of the English name.
+- Postal codes are basically missing (no Indian PINs, under 0.01% US ZIPs), so we couldn't
+  block on them and used street, city and house number instead.
+- France only appears in test (about 15% of S1). We never had French labels, so we kept the
+  features language-neutral and added some French address words to the normaliser.
+- A few parsing traps: names with literal quote characters, and names that are literally
+  "NA" or "null". We read everything with quoting and NA-conversion turned off and check row
+  counts.
+- The test pool is a bit denser than train (5.75 vs 4.68 S2+S3 records per S1), so we expect
+  test precision to be slightly harder.
 
-Noise seen in S2/S3: abbreviations (`Pvt Ltd` / `Private Limited`, `St` / `Street`), leetspeak
-(`Sh4rma`), aliases (`dba`, `aka`), domain-style names (`sharmatraders.com`), reordered words,
-typos, missing addresses (about 3%) and house numbers a few digits off.
+Typical noise in S2/S3: abbreviations (Pvt Ltd / Private Limited, St / Street), digits used as
+letters (Sh4rma), dba/aka aliases, website-style names (sharmatraders.com), reordered words,
+typos, empty addresses (~3%) and house numbers that are a few digits off.
 
 ### 2.2 Solution Strategy
 
-**Approach Type:** Blocking + classifier + assignment decision layer  
-**Core Innovation:**
-1. A word-level Indic-to-Latin dictionary learned from aligned matched training pairs. It covers
-   93% of Indic words in the test set, with no external data.
-2. Distractor-aware features: house-number distance, prefix matches and extra-word counts. In the
-   first model, 56% of false matches were near-duplicates that these features target.
-3. Candidate-context features (rank, gap to the best candidate, margin over the runner-up) computed
-   over the full candidate pool, so they have the same distribution at train and test time.
+**Approach Type:** Blocking + classifier (LightGBM) + a simple assignment step  
+**Core Innovation:** learned transliteration dictionary, distractor-focused features, and
+candidate-context features computed over the full candidate pool.
 
-Pipeline: `raw TSVs -> load + integrity checks -> normalise + transliterate -> blocking (top-10
-per S2/S3 record) -> pair features -> LightGBM -> one owner per record + threshold -> output files`.
+The flow is: load and check the TSVs, normalise and transliterate, block (top 10 per S2/S3
+record), build pair features, score with LightGBM, keep the best candidate per record if it
+passes the threshold, write the two output files.
+
+The context features (how a candidate ranks against the other candidates of the same record,
+the margin over the runner-up, how many records point at the same S1) turned out to be the
+most important ones. We compute them over the whole candidate table, for train as well as
+test, so they mean the same thing in both.
 
 ---
 
 ## 3. Candidate Generation (Blocking)
 
-Every S2/S3 record queries the Source 1 records **with the same country label** (`blocking.py`).
+Each S2/S3 record is compared only against S1 records with the same country label. We build
+hashed keys for every record:
 
-- **Blocking keys used** (all hashed to 64-bit integers):
-  - `n|`: single core-name tokens (legal forms and filler words removed), up to 4 per record
-  - `nn|`: order-free pairs of core-name tokens
-  - `c|`: the concatenated core name (catches `sharmatraders` vs `sharma traders`)
-  - `a|`: address tokens of 3+ characters, and all numeric tokens (house numbers), up to 10
-  - `aa|`: adjacent address-token bigrams
-  - `na|`: name token x address token combinations
-- **Scoring:** keys shared by more than 1,000 S1 records in the country are dropped. Each query
-  uses its rarest keys first, up to 24 keys or a total of 10,000 S1 postings. Candidates are
-  scored by the summed IDF of shared keys, and the top 10 per query are kept.
-- **Candidate pairs generated:** 102.5M on train (10.3M queries); **98.95M on test**
-  (France 14.3M, India 46.6M, US 38.0M). That is about 10 per S2/S3 record, versus 5.7 x 10^12
-  possible cross-source pairs in test.
-- **How true matches were kept:**
-  - Blocking is lossless across countries.
-  - Text is normalised and transliterated before keys are built.
-  - Several independent key families are used, so a record matches even when its name or its
-    address is noisy.
-  - On training, 98.2% of true links are in the top-10 candidates.
-- **Engineering:** blocking runs in chunks of 250k queries and 5M join rows with Polars on 4
-  threads, at about 5 GB of RAM for a full split (about 25 minutes). The top-k per query is taken
-  with a rank filter rather than `group_by().head()`, which retains the whole chunk table in
-  memory.
+- single "core" name tokens (legal forms like pvt/ltd/inc and filler words removed), up to 4
+- pairs of core name tokens (order doesn't matter)
+- the whole core name joined without spaces (catches "sharmatraders" vs "sharma traders")
+- address tokens with 3+ characters plus every number (house numbers), up to 10
+- neighbouring address token pairs
+- name token x address token combinations
 
-`output/candidate_pairs.tsv` is exactly the set of pairs the model scores.
+Keys that appear in more than 1,000 S1 records of a country are dropped as too common. Each
+query uses its rarest keys first (at most 24 keys, and at most 10,000 S1 postings in total),
+candidates are scored by the summed IDF of the keys they share, and we keep the top 20.
+
+The key-based search needs at least one whole word in common, so typos and merged words slip
+through. We added a second pass for that: character 3-gram TF-IDF on the core name, also per
+country, keeping the 10 most similar S1 names per record (trigrams found in more than 2% of S1
+names are ignored, and the sparse top-n search uses `sparse_dot_topn`). The two candidate lists
+are merged; a pair found by only one pass gets 0 for the other pass's score.
+
+- **Blocking keys used:** hashed name tokens, name token pairs, joined name, address tokens,
+  address bigrams, name x address combos (IDF scoring, no PIN/ZIP since they're missing), plus
+  char 3-gram TF-IDF similarity on names
+- **Candidate pairs generated:** 284.4M on train and 275,746,000 on test, about 27 per S2/S3
+  record (key pass 196.6M + TF-IDF pass 98.5M on test, minus the overlap).
+- **How you ensured true matches were not lost:** country blocking loses nothing, text is
+  normalised and transliterated before keys are built, and because there are several
+  independent kinds of keys a record can still be found when either its name or its address
+  is messy. On train, recall went from 98.15% (keys, top 10) to 98.50% (keys, top 20) and
+  98.93% with the TF-IDF pass added, so about 42% fewer true links are lost at this stage.
+
+Memory was the main practical problem on our 16 GB laptop. Blocking runs in chunks (250k
+queries at a time, 5M join rows per step, 4 Polars threads) and takes about 25 minutes and
+~5 GB per split. The final, bigger candidate set was built on an AWS r6i.4xlarge (16 vCPU,
+128 GB) using the challenge credits. One thing we learned the hard way: taking the top k per group with
+`group_by().head()` kept a reference to each whole chunk table and memory kept growing past
+26 GB; filtering on a rank column instead fixed it.
+
+`output/candidate_pairs.tsv` is exactly the list of pairs our model scores.
 
 ---
 
 ## 4. Matching Model
 
-Text normalisation (`normalize.py`) applies to both sides before any feature is computed:
-- Unicode NFKD, accent stripping and lower-casing.
-- Canonical word maps: street types, directions, ordinals, US and Indian state names, French
-  street words, and legal forms (`private` -> `pvt`, `incorporated` -> `inc`, ...).
-- Leetspeak repair and domain stripping.
-- Indic words replaced through the learned dictionary (`translit.py`).
+Before computing features, both sides go through the same normalisation: accents removed,
+lower case, punctuation to spaces, canonical forms for street types, directions, ordinals,
+US/Indian states, some French street words and legal forms (private -> pvt, incorporated ->
+inc, ...), digit-as-letter fixes, website suffixes removed, and Indic words replaced using the
+learned dictionary.
 
-**Features used** (49, `features.py`):
-- **Name features:**
-  - RapidFuzz ratio and token-set ratio on the full name.
-  - Token-sort, token-set, partial ratio and Jaro-Winkler on the core name.
-  - Ratio and partial ratio on the space-free core name.
-  - First-token equality, exact core-name equality, core-name lengths.
-  - Extra-word counts on each side (core-name and full-name level).
-  - Legal-form equality and conflict flag.
-- **Address features:**
-  - Token-set, token-sort and partial ratio on the canonicalised address; missing-address flag.
-  - House numbers: counts, overlap, Jaccard, first-number equality, log-distance between first
-    numbers and minimum log-distance across numbers, "near but different" flag (1-20 apart),
-    prefix flag (`67` vs `6705`).
-- **Other:**
-  - Blocking score and shared-key count.
-  - Candidate context per query: number of candidates, rank and gap by blocking score, rank and
-    gap by name+address score, gap to the best name and best address, margin over the runner-up,
-    number of candidates with the same core name.
-  - Crowding of the S1 record: how many queries retrieved it, and its rank among them.
-  - Record flags: source (2/3), Indic script, web-style name, alias marker.
-  - Country is deliberately **not** a feature, so the model transfers to France.
+**Features used** (50 in total):
+- Name features: RapidFuzz ratio and token-set ratio on the full name; token-sort, token-set,
+  partial ratio and Jaro-Winkler on the core name; ratio and partial ratio on the name without
+  spaces; first token equal; core name equal; name lengths; number of extra words on each side;
+  legal form equal / conflicting.
+- Address features: token-set, token-sort and partial ratio on the normalised address; address
+  missing flag; house numbers (counts, overlap, Jaccard, first number equal, log distance
+  between first numbers, smallest log distance between any numbers, "close but different"
+  flag for numbers 1-20 apart, prefix flag like 67 vs 6705).
+- Other: blocking score and number of shared keys; per record: number of candidates, rank and
+  gap by blocking score, rank and gap by name+address score, gap to the best name and best
+  address, margin over the second best, how many candidates have the same core name; per S1
+  record: how many records retrieved it and its rank among them; record flags (source 2/3,
+  Indic script, website-style name, alias marker); the TF-IDF name similarity. Country is not a
+feature on purpose, so the
+  model has a chance on France.
 
-**Model type:** LightGBM binary classifier (`num_leaves=127`, `learning_rate=0.05`,
-`min_data_in_leaf=100`, feature/bagging fraction 0.8, 2000 rounds).
+**Model type:** LightGBM binary classifier (num_leaves 127, learning rate 0.05,
+min_data_in_leaf 100, feature and bagging fraction 0.8, 2000 rounds).
 
-**Training data** (`train_full.py`, all training entities):
-- 10% of S1 entities, with all their records, plus 10% of unmatched records are held out for
-  validation.
-- From the remaining 90%, every positive and every hard negative is kept: the top-2 candidates of
-  the query by name+address score or by blocking score.
-- One in ten easy negatives is kept, with weight 10, so the loss stays unbiased.
-- In total: 31.9M training rows (6.75M positives) and 10.2M validation rows.
+Training data (`train_full.py`): we hold out 10% of the S1 entities (with all their records)
+plus 10% of the unmatched records for validation. From the other 90% we keep all positives,
+the two hardest negatives of every record (top 2 by name+address score or by blocking score),
+and 1 in 10 of the remaining easy negatives with weight 10 so the model still sees the right
+balance. That gives 49.3M training rows (6.80M positives) and 28.4M validation rows.
 
-**Threshold selection method:**
-- Each S2/S3 record keeps only its highest-probability candidate.
-- A threshold tau is swept on **exact macro F0.5** (re-implemented and unit-tested on the worked
-  example, 0.714) over the held-out entities.
-- Best: tau = 0.20.
+**Threshold selection method:** each S2/S3 record keeps only its highest-scoring candidate,
+then we sweep the threshold tau and pick the value with the best macro F0.5 on the held-out
+entities (our metric code reproduces the 0.714 worked example from the problem statement).
+Best tau was 0.20 (the curve is flat: 0.9903-0.9905 for tau 0.15-0.30).
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** **0.9888** on 220,981 held-out training entities (full-data model,
-  tau = 0.20). The earlier 12% sample model scored 0.9878 (2-fold out-of-fold); before the
-  distractor features, 0.9812.
+- **F_0.5 Score (macro):** 0.9905 on 220,981 held-out training entities (final model, tau =
+  0.20). Earlier versions on the way: 0.9812 before the distractor features, 0.9878 on a 12%
+  sample, 0.9888 with all the data but only the top-10 key blocking.
 
-| tau | 0.10 | 0.15 | **0.20** | 0.25 | 0.30 | 0.40 | 0.50 |
+Threshold sweep on the holdout:
+
+| tau | 0.10 | 0.15 | 0.20 | 0.25 | 0.30 | 0.40 | 0.50 |
 |---|---|---|---|---|---|---|---|
-| macro F0.5 | 0.98848 | 0.98877 | **0.98883** | 0.98880 | 0.98867 | 0.98832 | 0.98761 |
+| macro F0.5 | 0.99012 | 0.99042 | 0.99051 | 0.99045 | 0.99034 | 0.99003 | 0.98933 |
 
-Error breakdown (12% sample model, 914,635 true links among sampled records):
+Where the errors come from (12% sample model with the old top-10 blocking, 914,635 true
+links): 96.8% matched correctly; 1.8% never made it into the top 10 candidates (top 20 plus
+the TF-IDF pass later cut these misses to about 1.1%); 0.8% had another S1 ranked above the right
+one; 0.6% had the right S1 on top but below the threshold. There were 18,977 false matches,
+13,381 of them from records that don't belong to any S1.
 
-| Outcome | Count | Share |
-|---|---|---|
-| Matched correctly | 885,087 | 96.8% |
-| True S1 not in the top-10 candidates (blocking miss) | 16,893 | 1.8% |
-| Another S1 ranked first | 7,136 | 0.8% |
-| True S1 ranked first but below the threshold | 5,519 | 0.6% |
-| False matches | 18,977 | 13,381 from unmatched distractor records, 5,596 to the wrong S1 |
+- **Common false positives (wrong merges):** mostly distractors that look almost identical to
+  a real entity, e.g. the same name with one extra word ("Sharma Traders" vs "Sharma Traders
+  & Sons") or the same street with a slightly different house number (6705 vs 6708). Branches
+  of chains with the same name on nearby streets are the other big group.
+- **Common false negatives (missed matches):** mostly blocking misses, i.e. names with typos
+  or merged words that share no full token with the S1 name, and records whose address is
+  missing or very different. After that: Indic words that aren't in our dictionary and very
+  heavily abbreviated names.
 
-- **Common false positives (wrong merges):** distractor records that match no S1 but look
-  almost identical to one: the same name with an extra word (`Sharma Traders` vs `Sharma Traders &
-  Sons`), or the same street with a house number a few digits off (`6705` vs `6708`). Branches of
-  chains with the same name on nearby streets are the other common case.
-- **Common false negatives (missed matches):** mainly blocking misses. They are names with typos
-  or merged words sharing no whole token with the S1 name, plus records with missing or very
-  different addresses. The rest are Indic names whose words are outside the learned dictionary,
-  and heavily abbreviated names.
+On test we predict 6,045,857 matches, and 5.2% of S1 entities get no match (5.6% on train).
 
 ---
 
 ## 6. Conclusion
-A multi-key IDF blocking stage, a LightGBM matcher on string, house-number and candidate-context
-features, and a one-owner-per-record decision layer reach 0.9888 macro F0.5 on held-out training
-entities. Most of the gain over simple string matching came from modelling distractors explicitly
-and from a data-driven transliteration dictionary. The main lesson on a 16 GB machine was memory
-discipline: chunked blocking, streaming features to disk and chunked scoring made full-data
-training possible. The next gains are in blocking recall (the 1.8% of links never retrieved),
-for example with an extra character 3-gram TF-IDF nearest-neighbour pass.
+IDF-scored multi-key blocking, a LightGBM model on string, house number and context features,
+and a one-owner-per-record rule got us to 0.9905 macro F0.5 on held-out training entities.
+Most of the improvement over plain string matching came from handling distractors explicitly
+and from the transliteration dictionary. On a 16 GB machine we also had to be careful with
+memory: chunked blocking, writing features to disk and scoring in chunks is what made
+training on all the data possible. Adding the character 3-gram TF-IDF pass to the blocking was the last big gain; with more
+time we'd look at the ~1.1% of links that still never get retrieved.
 
 ---
 
 ## Appendix
 
 ### A. Code Artefacts
-`code/business_entity_resolution/` (see its `README.md`; dependencies pinned in `requirements.txt`).
-Scripts run from `src/`; set `POLARS_MAX_THREADS=4` on a 16 GB machine.
+Everything is in `code/business_entity_resolution/` (see `README.md` there, versions pinned
+in `requirements.txt`). Scripts are run from `src/`, with `POLARS_MAX_THREADS=4` on a 16 GB
+machine:
 
-| Step | Command | Output |
-|---|---|---|
-| 1 | `python block_split.py train` | transliteration dictionaries, prepared train records, train candidates |
-| 2 | `python train_full.py` | `work/model.txt`, `work/config.json` |
-| 3 | `python block_split.py test` | prepared test records, test candidates |
-| 4 | `python predict.py` | `output/candidate_pairs.tsv`, `output/matching_results.tsv` |
+1. `python block_split.py train --blocking v2` - learns the transliteration dictionaries,
+   prepares the train records and builds the train candidates (key pass + TF-IDF pass)
+2. `python train_full.py --blocking v2 --keep_k 0` - trains the model, writes
+   `work/model.txt` and `work/config.json`
+3. `python block_split.py test --blocking v2` - prepares the test records and builds the
+   test candidates
+4. `python predict.py` - writes `output/candidate_pairs.tsv` and `output/matching_results.tsv`
 
-Source modules: `io_utils.py` (loading, integrity checks, writers), `normalize.py`,
-`translit.py`, `blocking.py`, `features.py`, `pipeline.py` (shared prep, caching, chunked
-featurisation), `decide.py`, `metric.py`. `train.py` is the faster 12% sample variant with 2-fold
-out-of-fold validation. `exp_*.py` and `train_eval.py` are exploratory scripts.
+Modules: `io_utils.py` (reading/writing), `normalize.py`, `translit.py`, `blocking.py`,
+`tfidf_blocking.py`, `features.py`, `pipeline.py` (shared prep, caching, chunked features),
+`decide.py`,
+`metric.py`. `train.py` is a quicker version that trains on a sample with 2-fold validation;
+the `exp_*.py` files are small experiments we used while developing the blocking and
+transliteration.
 
-No external data, APIs or pre-trained models are used. Every table and dictionary is either
-hand-written (canonical word maps) or learned from the provided training data.
+We don't use any external data, APIs or pre-trained models. The word maps are written by
+hand and the dictionaries are learned from the provided training data only.
 
 ### B. Additional Results
-- Training time on a 16 GB, CPU-only laptop:
-  - Blocking: about 25 minutes per split.
-  - Full-data featurisation: about 10 minutes.
-  - LightGBM, 2000 rounds on 31.9M rows: about 38 minutes.
-  - Test scoring and writing: about 15-25 minutes.
-- Most important features by gain: margin over the runner-up, rank by name+address score, gap to
-  the best candidate, first-house-number log-distance, blocking-score gap, near-house-number flag,
-  extra-word count, house-number Jaccard.
+Run times for the final model on AWS r6i.4xlarge (16 vCPU, 128 GB): key blocking ~16 min and
+TF-IDF ~86 min on train, test blocking ~72 min, featurising 284M train pairs ~24 min,
+LightGBM (2000 rounds, 49.3M rows) ~70 min (partly sharing the CPU with test blocking), test
+scoring + writing ~97 min. The earlier top-10 version ran on our 16 GB laptop (blocking
+~25 min per split, training ~38 min).
+
+Most important features by gain: margin over the second-best candidate, rank by name+address
+score, gap to the best candidate, log distance of the first house number, blocking score gap,
+the "near house number" flag, extra word count and house-number Jaccard.
