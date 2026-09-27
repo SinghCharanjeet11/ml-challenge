@@ -1,54 +1,89 @@
 # Business Entity Resolution (team bruteforce)
 
 Matches Source 2 / Source 3 business records to Source 1 entities. Scored with macro F0.5 per
-Source 1 entity.
+Source 1 entity. Uses only the provided training/test data: no external data, APIs or lookups.
+
+Submitted result: public leaderboard **0.9795**, candidate set **5.2 pairs per Source 1 entity**.
 
 ## Setup
 
+Python 3.11+ (tested on 3.11 and 3.12).
+
 ```bash
 python -m venv .venv
-.venv/Scripts/pip install -r code/business_entity_resolution/requirements.txt
+.venv/bin/pip install -r code/business_entity_resolution/requirements.txt   # Windows: .venv\Scripts\pip
 ```
 
-Put the challenge data in `dataset/student_resource/dataset/{train,test}`. Run the scripts
-from `code/business_entity_resolution/src`. Intermediate files go to `work/`, the submission
-files to `output/`.
+Put the challenge data in `dataset/student_resource/dataset/{train,test}`. Run every script from
+`code/business_entity_resolution/src`. Intermediate files go to `work/`, submission files to `output/`.
 
-## How to run
+Hardware: the blocking step produces ~280M candidate pairs per split before the filter model cuts
+them down, so the full run needs ~128 GB RAM (we used an AWS r6i.4xlarge, 16 vCPU / 128 GB, ~5 h
+end to end). On a smaller machine set `POLARS_MAX_THREADS=4`.
 
-On a 16 GB machine set `POLARS_MAX_THREADS=4`, otherwise blocking can run out of memory. The
-v2 blocking (top 20 + tfidf, ~280M pairs per split) needs more; we ran it on a 128 GB AWS box.
+## Reproducing the submission (both output files)
 
 ```bash
-python block_split.py train --blocking v2        # dicts + prep + key and tfidf blocking
-python train_full.py --blocking v2 --keep_k 0    # train on all entities -> work/model.txt
-#   (without --blocking v2 it uses the smaller top-10 key blocking, which fits in 16 GB;
-#    python train.py --frac 0.12 is a faster version on a sample)
-python block_split.py test --blocking v2         # prep + blocking for test
-python predict.py                # -> output/candidate_pairs.tsv, output/matching_results.tsv
+cd code/business_entity_resolution/src
+python block_split.py train --blocking v2   # translit dictionaries + record prep + key blocking + tfidf blocking
+python block_split.py test --blocking v2
+python featurise_all.py train               # pair features for every candidate (written in parts to work/)
+python featurise_all.py test
+python stage2.py                            # filter model -> pruned candidates -> final model, tau 0.85
+                                            # -> output/candidate_pairs.tsv and output/matching_results.tsv
 
 cd ../../../dataset/student_resource
 python utils/validate_submission.py --matching ../../output/matching_results.tsv \
-    --candidate ../../output/candidate_pairs.tsv --test-dir dataset/test
+    --candidate ../../output/candidate_pairs.tsv --test-dir dataset/test --check-ids
 ```
 
-## Files in src/
+`stage2.py` defaults are exactly the submitted configuration: training split `train`, filter
+p >= 0.01 and at most 3 candidates per record, final threshold 0.85.
+`python rethreshold.py cascade 0.8,0.9` rewrites the matching file at other thresholds from the
+saved scores without re-running anything.
 
-- `io_utils.py` - reading the TSVs, writing the submission files
-- `normalize.py` - text cleaning and canonical word maps
-- `translit.py` - Indic -> Latin word dictionary learned from the train matches
-- `blocking.py` - candidate generation (hashed name/address keys, IDF scoring, top k)
-- `tfidf_blocking.py` - second blocking pass: char 3-gram tfidf on names
-- `features.py` - pair features
-- `pipeline.py` - shared prep / caching / chunked featurising
-- `decide.py` - one owner per S2/S3 record + threshold
-- `metric.py` - macro F0.5
-- `exp_*.py` - small experiments from development
+## Pipeline (files in src/)
+
+| Step | File |
+|---|---|
+| Reading TSVs (quoting off, row counts checked), writing submission files | `io_utils.py` |
+| Text cleaning, canonical word maps (street types, states, legal forms) | `normalize.py` |
+| Indic -> Latin word dictionary learned from train matches | `translit.py` |
+| Key blocking: hashed name/address keys, IDF scoring, top 20 per record, per country | `blocking.py` |
+| Char 3-gram TF-IDF name blocking, top 10 per record, per country | `tfidf_blocking.py` |
+| Record prep, candidate caching, chunked featurising | `pipeline.py`, `block_split.py`, `featurise_all.py` |
+| Pair features (name, address, house number, legal form, candidate context) | `features.py` |
+| Cascade: filter model, pruning (= candidate set), competition features, final model | `stage2.py` |
+| One owner per S2/S3 record + threshold | `decide.py` |
+| Macro F0.5 (matches the challenge definition) | `metric.py` |
+| Re-thresholding saved scores | `rethreshold.py` |
+
+## Experiments (not needed to reproduce the submission)
+
+Kept because the methodology document refers to them. Each one runs from `src/` on the cached
+`work/` files.
+
+- `train.py`, `train_full.py`, `predict.py` - earlier single-model pipeline (no filter model)
+- `exp_*.py` - early blocking / transliteration studies
+- `stage2.py --anchor` - corrected validation split (non-matching records follow the S1 entity
+  they are closest to); `--neg_weight`, `--word_features`, `--prune`, `--max_per_record` variants
+- `cascade_holdout.py` - re-scores the saved cascade on a holdout
+- `synth_decoys.py` - synthetic decoy records for stress-testing the validation
+- `shift_correct.py`, `segment_threshold.py`, `cell_decision.py` - train -> test shift corrections
+- `word_features.py` - token-level typo vs word-replacement features (used by `--word_features`)
+- `cross_encoder.py` - fine-tuned transformer cross-encoder on uncertain pairs
+  (extra dependencies in `requirements-experiments.txt`; model `cross-encoder/ms-marco-MiniLM-L-6-v2`,
+  Apache-2.0, 22.7M parameters)
 
 ## Results
 
-- Final: v2 blocking + all training entities, 10% holdout: macro F0.5 = 0.9905 at tau 0.20
-- Same with top-10 key blocking only: 0.9888 at tau 0.20
-- 12% sample (`train.py`), 2-fold out-of-fold: 0.9878 at tau 0.25
-- Blocking recall on train: 98.15% (keys top 10) -> 98.93% (keys top 20 + tfidf)
-- Test: 275.7M candidate pairs, 6.05M predicted matches
+| | Value |
+|---|---|
+| Public leaderboard (submitted: cascade, tau 0.85) | **0.9795** |
+| Candidate set (test) | 8,959,722 pairs, **5.2 per Source 1 entity** (275.7M before the filter) |
+| Blocking recall on train (true links among candidates) | 98.93% before the filter, 98.38% after |
+| Holdout macro F0.5, corrected validation split | ~0.987 |
+
+The threshold (0.85, vs ~0.5 on the holdout) was picked on the public leaderboard: test has about
+twice as many non-matching records per Source 1 entity as train. Details in
+`Documentation_template.md`.
