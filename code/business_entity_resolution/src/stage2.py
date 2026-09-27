@@ -15,8 +15,8 @@ Steps:
    every train pair; test gets the average of the two fold models.
 2. Prune: keep pairs with p1 >= --prune among the top --max_per_record of their record.
 3. Competition features from p1 over the pruned tables.
-4. Final model on the pruned pairs, same 90/10 entity split as train_full.py so the holdout
-   score is comparable. Writes model files, candidate_pairs and matching files for test.
+4. Final model on the pruned pairs (90/10 entity split). Writes model files, candidate_pairs
+   and matching files for test.
 
 Needs featurise_all.py train and test first.
 """
@@ -44,13 +44,13 @@ ap.add_argument("--easy_every", type=int, default=10)
 ap.add_argument("--filter_rounds", type=int, default=300)
 ap.add_argument("--final_rounds", type=int, default=2000)
 ap.add_argument("--val_mod", type=int, default=10)
-ap.add_argument("--split", default="train", help="train, or train_aug (with synthetic decoys)")
+ap.add_argument("--split", default="train")
 ap.add_argument("--tag", default="", help="suffix for saved models / scores / output files")
 ap.add_argument("--anchor", action="store_true",
                 help="put each non-matching record in the fold of the S1 entity it is closest to (its top blocking candidate), so holdout entities face all their decoys; without it they only see ~10%% of them")
 ap.add_argument("--filter_from", default=None, help="reuse the filter models saved under this tag (same split)")
-ap.add_argument("--word_features", action="store_true",
-                help="add word-level (replaced word vs typo, legal form, digit edits) and twin features")
+ap.add_argument("--save_comp", action="store_true",
+                help="save the pruned pairs with competition features (for the cross-encoder stage)")
 ap.add_argument("--neg_weight", type=float, default=1.0,
                 help="weight of non-matching records in the final model (test has ~2x more of them than train)")
 ap.add_argument("--final_tau", type=float, default=0.85,
@@ -73,9 +73,8 @@ oids = op.select("io", pl.col("entity_id").alias("o_id"))
 _, _, gt = load_split(args.data, "train")
 pairs = gt_pairs(gt)
 owner = pairs.join(s1ids, on="s1_id").join(oids, on="o_id").select("io", pl.col("i1").alias("owner"))
-# synthetic decoys match nothing but follow the S1 entity they were made from into its fold / holdout
-parent = (pl.read_parquet(f"{W}/{args.split}_parent.parquet") if args.split != "train"
-          else pl.DataFrame(schema={"io": pl.UInt32, "parent": pl.UInt32}))
+# records that match nothing have no owner; with --anchor they follow their top blocking candidate
+parent = pl.DataFrame(schema={"io": pl.UInt32, "parent": pl.UInt32})
 if args.anchor:
     cand = pl.read_parquet(f"{W}/{args.split}_cand_v2.parquet", columns=["io", "i1", "block_score"])
     anchor = (cand.sort(["io", "block_score"], descending=[False, True]).group_by("io", maintain_order=True).head(1)
@@ -111,7 +110,7 @@ for k in (0, 1):
         models.append(m)
         for part in train_parts:
             d = labelled(part, fcols).filter(pl.col("fold") == k)
-            p1_parts.append(d.select("io", "i1", "y", "val").with_columns(
+            p1_parts.append(d.select("io", "i1", "y", "val", "fold").with_columns(
                 pl.Series("p1", m.predict(matrix(d, FILTER_FEATURES)), dtype=pl.Float32)))
         log(f"filter fold {k}: reused {args.filter_from}")
         continue
@@ -132,7 +131,7 @@ for k in (0, 1):
     models.append(m)
     for part in train_parts:
         d = labelled(part, fcols).filter(pl.col("fold") == k)
-        p1_parts.append(d.select("io", "i1", "y", "val").with_columns(
+        p1_parts.append(d.select("io", "i1", "y", "val", "fold").with_columns(
             pl.Series("p1", m.predict(matrix(d, FILTER_FEATURES)), dtype=pl.Float32)))
 p1_train = pl.concat(p1_parts)
 del p1_parts
@@ -200,41 +199,11 @@ comp_train = competition(p1_train, pl.read_parquet(f"{W}/{args.split}_op.parquet
 comp_test = competition(p1_test, pl.read_parquet(f"{W}/test_op.parquet", columns=["io", "src"]))
 del p1_train, p1_test
 log("competition features done")
+if args.save_comp:
+    comp_train.write_parquet(f"{W}/comp_train{args.tag}.parquet")
+    comp_test.write_parquet(f"{W}/comp_test{args.tag}.parquet")
+    log("pruned pairs + competition features saved")
 
-if args.word_features:
-    from rapidfuzz import fuzz
-    from word_features import WORD_FEATURES, word_features
-    TXT = ["core", "legal", "num0", "nm", "ad", "src"]
-
-    def add_text_features(comp, split):
-        s1t = pl.read_parquet(f"{W}/{split}_s1p.parquet", columns=["i1", "core", "legal", "num0"]).rename(
-            {"core": "core_1", "legal": "legal_1", "num0": "num0_1"})
-        opt = pl.read_parquet(f"{W}/{split}_op.parquet", columns=["io"] + TXT)
-        d = comp.select("io", "i1", "q_best").join(opt, on="io").join(s1t, on="i1")
-        wf = word_features(d)
-        # twin features: compare with the other records whose best candidate is the same S1
-        txt = (pl.col("nm") + " | " + pl.col("ad"))
-        claims = d.filter(pl.col("q_best")).select("i1", pl.col("io").alias("io2"), txt.alias("t2"),
-                                                   pl.col("src").alias("src2"), pl.col("num0").alias("n2"))
-        pr = d.select("io", "i1", txt.alias("t"), "src", "num0").join(claims, on="i1").filter(pl.col("io") != pl.col("io2"))
-        sim = [fuzz.ratio(a, b) for a, b in zip(pr["t"].to_list(), pr["t2"].to_list())]
-        pr = pr.with_columns(pl.Series("sim", sim, dtype=pl.Float32))
-        tw = pr.group_by("io", "i1").agg(
-            pl.col("sim").max().alias("tw_sim_max"),
-            pl.col("sim").filter(pl.col("src") == pl.col("src2")).max().alias("tw_sim_same_src"),
-            (pl.col("num0") == pl.col("n2")).mean().alias("tw_num_agree"),
-            (pl.col("sim") >= 90).sum().alias("tw_n_near"))
-        out = pl.concat([d.select("io", "i1"), wf], how="horizontal").join(tw, on=["io", "i1"], how="left")
-        out = out.with_columns(pl.col("tw_sim_max", "tw_sim_same_src", "tw_num_agree").fill_null(-1),
-                               pl.col("tw_n_near").fill_null(0))
-        return comp.join(out, on=["io", "i1"], how="left")
-
-    comp_train = add_text_features(comp_train, args.split).sort("io")
-    comp_test = add_text_features(comp_test, "test").sort("io")
-    TWIN = ["tw_sim_max", "tw_sim_same_src", "tw_num_agree", "tw_n_near"]
-    COMP = COMP + WORD_FEATURES + TWIN
-    FINAL_FEATURES = FEATURES + COMP
-    log(f"word + twin features added ({len(WORD_FEATURES) + len(TWIN)})")
 
 
 def with_comp(d, comp):
