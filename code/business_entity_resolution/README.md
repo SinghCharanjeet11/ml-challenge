@@ -3,7 +3,7 @@
 Matches Source 2 / Source 3 business records to Source 1 entities. Scored with macro F0.5 per
 Source 1 entity. Uses only the provided training/test data: no external data, APIs or lookups.
 
-Submitted result: public leaderboard **0.9795**, candidate set **5.2 pairs per Source 1 entity**.
+Submitted result: public leaderboard **0.9850**, candidate set **5.2 pairs per Source 1 entity**.
 
 ## Setup
 
@@ -11,8 +11,12 @@ Python 3.11+ (tested on 3.11 and 3.12).
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -r code/business_entity_resolution/requirements.txt   # Windows: .venv\Scripts\pip
+.venv/bin/pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu   # CPU steps
+.venv/bin/pip install -r code/business_entity_resolution/requirements.txt         # Windows: .venv\Scripts\pip
 ```
+
+The cross-encoder steps (`reranker.py fit|score`) need a CUDA GPU (we used one NVIDIA A10G,
+AWS g5.2xlarge, with the CUDA build of PyTorch); everything else runs on CPU.
 
 Put the challenge data in `dataset/student_resource/dataset/{train,test}`. Run every script from
 `code/business_entity_resolution/src`. Intermediate files go to `work/`, submission files to `output/`.
@@ -29,18 +33,35 @@ python block_split.py train --blocking v2   # translit dictionaries + record pre
 python block_split.py test --blocking v2
 python featurise_all.py train               # pair features for every candidate (written in parts to work/)
 python featurise_all.py test
-python stage2.py                            # filter model -> pruned candidates -> final model, tau 0.85
-                                            # -> output/candidate_pairs.tsv and output/matching_results.tsv
+python stage2.py --anchor --neg_weight 2 --save_comp --tag _f
+                                            # filter model -> pruned candidates (= candidate set) -> competition
+                                            # features (--anchor: holdout entities see all their non-matching records)
+python reranker.py text train               # multilingual cross-encoder (BAAI/bge-reranker-base) on every candidate:
+python reranker.py text test                #   raw text per record
+python reranker.py pairs                    #   training pairs + record folds (our run took the train pairs from the
+                                            #   key-only candidates, which were ready earlier: --cand v1 --splits train)
+python reranker.py fit 0 --check            #   GPU: one model per fold, 2.5M pairs each ...
+python reranker.py fit 1 --check
+python reranker.py fit 0 --init ../../../work/rr_model_0 --n_pos 600000 --n_neg 800000 --lr 1.5e-5 --seed 5 --tag _b --check
+python reranker.py fit 1 --init ../../../work/rr_model_1 --n_pos 600000 --n_neg 800000 --lr 1.5e-5 --seed 5 --tag _b --check
+                                            #   ... then a second pass on fresh pairs (kept: better on the other fold)
+python -c "import polars as pl; [pl.read_parquet(f'../../../work/comp_{s}_f.parquet', columns=['io','i1']).write_parquet(f'../../../work/rr_pruned_{s}.parquet') for s in ('train','test')]"
+python reranker.py score test --tag _b      #   each pair scored by the model of the other fold
+python reranker.py score train --tag _b
+python stage3.py --rr_tag _b                # final LightGBM with the cross-encoder features
+python rethreshold.py RR 0.83               # -> output/matching_results_RR_tau0.83.tsv
+cp ../../../output/matching_results_RR_tau0.83.tsv ../../../output/matching_results.tsv
+cp ../../../output/candidate_pairs_f.tsv ../../../output/candidate_pairs.tsv
 
 cd ../../../dataset/student_resource
 python utils/validate_submission.py --matching ../../output/matching_results.tsv \
     --candidate ../../output/candidate_pairs.tsv --test-dir dataset/test --check-ids
 ```
 
-`stage2.py` defaults are exactly the submitted configuration: training split `train`, filter
-p >= 0.01 and at most 3 candidates per record, final threshold 0.85.
-`python rethreshold.py cascade 0.8,0.9` rewrites the matching file at other thresholds from the
-saved scores without re-running anything.
+The candidate set is the filter's output: at most 3 candidates per record with filter
+probability >= 0.01. `rethreshold.py` rewrites a matching file at other thresholds from saved
+scores. The threshold 0.83 gives 5,797,252 matches; `Documentation_template.md` (section 5)
+explains how we chose it.
 
 ## Pipeline (files in src/)
 
@@ -54,36 +75,29 @@ saved scores without re-running anything.
 | Record prep, candidate caching, chunked featurising | `pipeline.py`, `block_split.py`, `featurise_all.py` |
 | Pair features (name, address, house number, legal form, candidate context) | `features.py` |
 | Cascade: filter model, pruning (= candidate set), competition features, final model | `stage2.py` |
+| Multilingual cross-encoder on every candidate (cross-fitted, GPU) | `reranker.py` |
+| Final LightGBM with cross-encoder features | `stage3.py` |
 | One owner per S2/S3 record + threshold | `decide.py` |
 | Macro F0.5 (matches the challenge definition) | `metric.py` |
 | Re-thresholding saved scores | `rethreshold.py` |
 
-## Experiments (not needed to reproduce the submission)
-
-Kept because the methodology document refers to them. Each one runs from `src/` on the cached
-`work/` files.
-
-- `train.py`, `train_full.py`, `predict.py` - earlier single-model pipeline (no filter model)
-- `exp_*.py` - early blocking / transliteration studies
-- `stage2.py --anchor` - corrected validation split (non-matching records follow the S1 entity
-  they are closest to); `--neg_weight`, `--word_features`, `--prune`, `--max_per_record` variants
-- `cascade_holdout.py` - re-scores the saved cascade on a holdout
-- `synth_decoys.py` - synthetic decoy records for stress-testing the validation
-- `shift_correct.py`, `segment_threshold.py`, `cell_decision.py` - train -> test shift corrections
-- `word_features.py` - token-level typo vs word-replacement features (used by `--word_features`)
-- `cross_encoder.py` - fine-tuned transformer cross-encoder on uncertain pairs
-  (extra dependencies in `requirements-experiments.txt`; model `cross-encoder/ms-marco-MiniLM-L-6-v2`,
-  Apache-2.0, 22.7M parameters)
+Only the code of the submitted pipeline is included. Earlier submissions (single LightGBM model,
+LightGBM cascade alone, small English cross-encoder on uncertain pairs) and the experiments that
+did not make it are described in `Documentation_template.md` (Appendix B).
 
 ## Results
 
 | | Value |
 |---|---|
-| Public leaderboard (submitted: cascade, tau 0.85) | **0.9795** |
-| Candidate set (test) | 8,959,722 pairs, **5.2 per Source 1 entity** (275.7M before the filter) |
-| Blocking recall on train (true links among candidates) | 98.93% before the filter, 98.38% after |
-| Holdout macro F0.5, corrected validation split | ~0.987 |
+| Public leaderboard, submitted (multilingual cross-encoder features) | **0.9850** |
+| Public leaderboard, cascade + small cross-encoder on uncertain pairs | 0.9808 |
+| Public leaderboard, LightGBM cascade alone (tau 0.85) | 0.9795 |
+| Candidate set (test) | 8,946,074 pairs, **5.2 per Source 1 entity** (275.7M before the filter) |
+| Blocking recall on train (true links among candidates) | 98.93% before the filter, 98.39% after |
+| Holdout macro F0.5, corrected validation split | 0.9872 (LightGBM) -> 0.9918 (+ cross-encoder features) |
 
-The threshold (0.85, vs ~0.5 on the holdout) was picked on the public leaderboard: test has about
-twice as many non-matching records per Source 1 entity as train. Details in
+Model licences: LightGBM (MIT); cross-encoder `BAAI/bge-reranker-base` (MIT, 278M parameters),
+fine-tuned only on the training data (earlier: `cross-encoder/ms-marco-MiniLM-L-6-v2`,
+Apache-2.0). Thresholds were set for test conditions
+(test has about twice as many non-matching records per Source 1 entity as train). Details in
 `Documentation_template.md`.
