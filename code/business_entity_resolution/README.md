@@ -11,19 +11,22 @@ Python 3.11+ (tested on 3.11 and 3.12).
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu   # CPU steps
+.venv/bin/pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128  # GPU build (CPU-only: /whl/cpu)
 .venv/bin/pip install -r code/business_entity_resolution/requirements.txt         # Windows: .venv\Scripts\pip
 ```
 
-The cross-encoder steps (`reranker.py fit|score`) need a CUDA GPU (we used one NVIDIA A10G,
-AWS g5.2xlarge, with the CUDA build of PyTorch); everything else runs on CPU.
+The cross-encoder steps (`reranker.py fit|score`) need a CUDA GPU. We used one NVIDIA A10G (AWS
+g5.2xlarge, Deep Learning AMI) with PyTorch 2.7.0 + CUDA 12.8 and transformers 4.57.1, in bf16.
+Everything else runs on CPU. The pretrained weights (`BAAI/bge-reranker-base`, MIT) are
+downloaded from the Hugging Face hub on first use.
 
 Put the challenge data in `dataset/student_resource/dataset/{train,test}`. Run every script from
 `code/business_entity_resolution/src`. Intermediate files go to `work/`, submission files to `output/`.
 
 Hardware: the blocking step produces ~280M candidate pairs per split before the filter model cuts
-them down, so the full run needs ~128 GB RAM (we used an AWS r6i.4xlarge, 16 vCPU / 128 GB, ~5 h
-end to end). On a smaller machine set `POLARS_MAX_THREADS=4`.
+them down, so the CPU steps need ~128 GB RAM (we used an AWS r6i.4xlarge, 16 vCPU / 128 GB, ~4 h
+for blocking, features and stage2). On a smaller machine set `POLARS_MAX_THREADS=4`. The GPU steps
+take ~5 h on one A10G (~3 h fine-tuning, ~1.7 h scoring 18.7M train + test pairs); stage3 ~5 min.
 
 ## Reproducing the submission (both output files)
 
@@ -39,14 +42,14 @@ python stage2.py --anchor --neg_weight 2 --save_comp --tag _f
 python reranker.py text train               # multilingual cross-encoder (BAAI/bge-reranker-base) on every candidate:
 python reranker.py text test                #   raw text per record
 python reranker.py pairs                    #   training pairs + record folds (our run took the train pairs from the
-                                            #   key-only candidates, which were ready earlier: --cand v1 --splits train)
+                                            #   key-only candidates, which were ready earlier: `block_split.py train`,
+                                            #   then `reranker.py pairs --cand v1 --splits train` and `--splits test`)
 python reranker.py fit 0 --check            #   GPU: one model per fold, 2.5M pairs each ...
 python reranker.py fit 1 --check
 python reranker.py fit 0 --init ../../../work/rr_model_0 --n_pos 600000 --n_neg 800000 --lr 1.5e-5 --seed 5 --tag _b --check
 python reranker.py fit 1 --init ../../../work/rr_model_1 --n_pos 600000 --n_neg 800000 --lr 1.5e-5 --seed 5 --tag _b --check
                                             #   ... then a second pass on fresh pairs (kept: better on the other fold)
-python -c "import polars as pl; [pl.read_parquet(f'../../../work/comp_{s}_f.parquet', columns=['io','i1']).write_parquet(f'../../../work/rr_pruned_{s}.parquet') for s in ('train','test')]"
-python reranker.py score test --tag _b      #   each pair scored by the model of the other fold
+python reranker.py score test --tag _b      #   scores stage2's candidate set; each pair by the model of the other fold
 python reranker.py score train --tag _b
 python stage3.py --rr_tag _b                # final LightGBM with the cross-encoder features
 python rethreshold.py RR 0.83               # -> output/matching_results_RR_tau0.83.tsv
@@ -97,7 +100,7 @@ did not make it are described in `Documentation_template.md` (Appendix B).
 | Holdout macro F0.5, corrected validation split | 0.9872 (LightGBM) -> 0.9918 (+ cross-encoder features) |
 
 Model licences: LightGBM (MIT); cross-encoder `BAAI/bge-reranker-base` (MIT, 278M parameters),
-fine-tuned only on the training data (earlier: `cross-encoder/ms-marco-MiniLM-L-6-v2`,
-Apache-2.0). Thresholds were set for test conditions
-(test has about twice as many non-matching records per Source 1 entity as train). Details in
+fine-tuned only on the training data. Our earlier 0.9808 submission used
+`cross-encoder/ms-marco-MiniLM-L-6-v2` (Apache-2.0). Thresholds were set for test conditions (test
+has about twice as many non-matching records per Source 1 entity as train). Details in
 `Documentation_template.md`.
