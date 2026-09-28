@@ -198,10 +198,11 @@ def stage_fit(fold, n_pos, n_neg, text, tag, batch=128, lr=3e-5, check=False, in
             f"errors at 0.5: {int(((pr >= 0.5) != ye).sum())} of {len(ye):,} (false matches {int(((pr >= 0.5) & hard).sum())})")
 
 
-def stage_score(split, tag):
+def stage_score(split, tag, comp_tag):
+    """Score the candidate set: the pruned pairs saved by `stage2.py --save_comp --tag <comp_tag>`."""
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
-    pairs = pl.read_parquet(f"{W}/rr_pruned_{split}.parquet").join(
+    pairs = pl.read_parquet(f"{W}/comp_{split}{comp_tag}.parquet", columns=["io", "i1"]).join(
         pl.read_parquet(f"{W}/{split}_rr_fold.parquet"), on="io", how="left").with_columns(pl.col("cefold").fill_null(0))
     s1t, opt = texts(split)
     out = []
@@ -221,8 +222,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=["text", "pairs", "fit", "score"])
     ap.add_argument("arg", nargs="?")
-    ap.add_argument("--n_pos", type=int, default=700_000)
-    ap.add_argument("--n_neg", type=int, default=1_000_000)
+    ap.add_argument("--n_pos", type=int, default=1_000_000)
+    ap.add_argument("--n_neg", type=int, default=1_500_000)
+    ap.add_argument("--comp_tag", default="_f", help="tag of the stage2 run whose pruned pairs are scored")
     ap.add_argument("--text", default="t", help="t = raw text, tn = our normalised text")
     ap.add_argument("--tag", default="")
     ap.add_argument("--check", action="store_true", help="after fitting, score a sample of the other fold")
@@ -239,4 +241,4 @@ if __name__ == "__main__":
     elif a.stage == "fit":
         stage_fit(int(a.arg), a.n_pos, a.n_neg, a.text, a.tag, lr=a.lr, check=a.check, init=a.init, seed=a.seed)
     else:
-        stage_score(a.arg, a.tag)
+        stage_score(a.arg, a.tag, a.comp_tag)

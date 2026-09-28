@@ -2,7 +2,7 @@
 
 **Team Name:** bruteforce  
 **Team Members:** Charanjeet Singh, Vanshika Srivastava  
-**Submission Date:** 2026-09-27
+**Submission Date:** 2026-09-28
 
 ---
 
@@ -114,13 +114,13 @@ share no whole word. Trigrams in more than 2% of S1 names are ignored. The spars
 uses `sparse_dot_topn`. The two lists are merged; a pair found by one pass only gets 0 for the
 other pass's score.
 
-**Step 3: learned filter.** Steps 1–2 give ~27 candidates per record (284M pairs on train, 276M on
+**Step 3: learned filter.** Steps 1 and 2 give ~27 candidates per record (284M pairs on train, 276M on
 test).
 - A light LightGBM (20 cheap features, 300 trees) scores every pair. The features are blocking
   and TF-IDF scores, ranks and gaps, core-name ratio, token sort, Jaro-Winkler, address token set,
   house-number overlap and distance, source, and missing address.
 - It's trained out-of-fold on train (2 folds split by entity).
-- We keep, per record, at most its top 3 candidates with filter probability ≥ 0.01.
+- We keep, per record, at most its top 3 candidates with filter probability >= 0.01.
 - **These pairs are the candidate set:** exactly what the final model scores and what
   `candidate_pairs.tsv` contains.
 
@@ -129,8 +129,8 @@ test).
 | Key blocking, top 10 | 46 | 98.15% |
 | Key blocking, top 20 | 92 | 98.50% |
 | Keys top 20 + TF-IDF | 128.9 | 98.93% |
-| **+ filter (p ≥ 0.01, top 3 per record), submitted** | **4.4** | **98.39%** |
-| Filter alternatives: p ≥ 0.001 top 5 / p ≥ 0.05 top 2 | 5.4 / 4.0 | 98.64% / 97.95% |
+| **+ filter (p >= 0.01, top 3 per record), submitted** | **4.4** | **98.39%** |
+| Filter alternatives: p >= 0.001 top 5 / p >= 0.05 top 2 | 5.4 / 4.0 | 98.64% / 97.95% |
 
 - **Blocking keys used:** hashed name tokens, name token pairs, joined name, address tokens,
   address bigrams, name x address combos (IDF scoring), char 3-gram TF-IDF on names, plus a
@@ -141,13 +141,14 @@ test).
   - Country blocking is lossless.
   - Text is normalised and transliterated before keys are built.
   - Two independent retrieval passes find a record when either its name or its address is messy.
-  - The filter costs 0.54 points of recall (98.93% → 98.39%) for a ~29x smaller candidate set.
+  - The filter costs 0.54 points of recall (98.93% to 98.39%) for a ~29x smaller candidate set.
 
 Memory was the main practical constraint:
 - On our 16 GB laptop, blocking runs in chunks (250k queries, 5M join rows, 4 Polars threads).
 - Taking the top k per group with `group_by().head()` kept whole chunk tables alive, and memory
   grew past 26 GB. Filtering on a rank column fixed it.
-- The full cascade ran on an AWS r6i.4xlarge (16 vCPU, 128 GB) using the challenge credits.
+- The full cascade ran on an AWS r6i.4xlarge (16 vCPU, 128 GB) using the challenge credits, and the
+  cross-encoder on a g5.2xlarge (one A10G GPU).
 
 ---
 
@@ -160,7 +161,8 @@ Normalisation is the same on both sides:
 - digit-as-letter fixes and website suffixes removed
 - Indic words replaced through the learned dictionary
 
-**Features used** (50 pair features + 17 competition features):
+**Features used** (50 pair features + 17 competition features; the 11 cross-encoder features are
+listed under the model type below):
 - **Name features:**
   - RapidFuzz ratio / token-set on the full name
   - token-sort, token-set, partial ratio and Jaro-Winkler on the core name
@@ -171,7 +173,7 @@ Normalisation is the same on both sides:
 - **Address features:**
   - token-set, token-sort and partial ratio on the normalised address; address-missing flag
   - house numbers: counts, overlap, Jaccard, first number equal, log distance between first
-    numbers, smallest log distance between any numbers, "close but different" flag (1–20 apart),
+    numbers, smallest log distance between any numbers, "close but different" flag (1 to 20 apart),
     prefix flag (67 vs 6705)
 - **Candidate context:**
   - blocking score and shared keys
@@ -214,9 +216,10 @@ section 5 for how the count was chosen).
 - For the LightGBM cascade, the best threshold on the training holdout is ~0.5 (corrected split,
   section 5).
 - Test has about twice as many non-matching records per entity, so we set the threshold for
-  test on the public leaderboard: 0.80 → 0.9793, **0.85 → 0.9795**, 0.90 → 0.9790, 0.95 → 0.9769.
+  test on the public leaderboard: 0.80 gave 0.9793, **0.85 gave 0.9795**, 0.90 gave 0.9790 and 0.95
+  gave 0.9769.
 - The metric code reproduces the 0.714 worked example and was cross-checked against an
-  independent implementation (difference ≤ 3e-13).
+  independent implementation (difference below 3e-13).
 
 ---
 
@@ -241,8 +244,8 @@ Leaderboard progression:
 
 **Threshold of the final model.** On the corrected holdout, with non-matching records counted
 twice, the final model's best number of matches is 0.6% above the cascade's (750,953 vs 746,332).
-Our probes with the cascade had shown that its best test count is around 5.76–5.79M, and that too
-few matches cost more than too many (+30k matches: −0.0002; −40k: −0.0005). So we submitted
+Our probes with the cascade had shown that its best test count is around 5.76M to 5.79M, and that too
+few matches cost more than too many (30k more matches cost 0.0002, 40k fewer cost 0.0005). So we submitted
 5,797,252 matches (threshold 0.83) rather than the previous 5,762,921. The model is confident:
 between thresholds 0.5 and 0.95 its test match count changes by only 1.7%.
 
@@ -253,16 +256,17 @@ word is "group", "holdings", "exports" or "infratech", and ~99% of the time when
 the cross-encoder can, and being multilingual it carries the rule over to France, which it never
 saw in training: test records adding "Groupe" to their S1 name were accepted 16% of the time by
 the cascade and 0.03% of the time by the cross-encoder. On test the two models disagree on 5.8%
-of French records, against 1.2–1.8% for India and the US.
+of French records, against 1.2% to 1.8% for India and the US.
 
-**Validation lesson (important).** For most of the project our holdout reported ~0.991. The split
+**A lesson about validation.** For most of the project our holdout reported ~0.991. The split
 put each S1 entity and its true records in the holdout, but assigned records that match nothing
 by a random hash of the record id. So each holdout entity faced only ~10% of its decoys, and the
 holdout understated the decoy problem about tenfold. The correct split assigns a non-matching
 record to the fold of the S1 entity it is closest to (its top blocking candidate). With it, the
 same model scores 0.987 at best, prefers a much stricter threshold, and behaves much more like
-the leaderboard. We found this late; the submitted model's threshold was already tuned on the
-leaderboard, but earlier design choices were made against the optimistic number.
+the leaderboard. We found this late, so many earlier design choices were made against the
+optimistic number. The final model (stage2 + cross-encoder + stage3) was trained and checked on the
+corrected split.
 
 **Where errors come from** (LightGBM cascade before the cross-encoder, corrected holdout,
 threshold 0.6, score 0.9865; gain if each error type were fixed):
@@ -279,8 +283,8 @@ threshold 0.6, score 0.9865; gain if each error type were fixed):
     extra or swapped business word ("Dds Forestry" vs "Dds Services"), a different legal form;
   - different businesses at the same address;
   - records with no address that share a name with several S1 entities.
-  - On test, these decoys are more numerous and harder than in train, which is why a stricter
-    threshold (0.85) wins there.
+  - On test, these decoys are more numerous and harder than in train, which is why the cascade
+    needed a much stricter threshold there (0.85 instead of ~0.5).
 - **Common false negatives (missed matches):**
   - records without an address, where several same-named S1 entities compete;
   - names with typos or merged words that no blocking key retrieves;
@@ -303,8 +307,8 @@ What we learned:
 - **A pretrained multilingual model learns rules our features could not express**, such as which
   added word marks a decoy, and applies them to a language it never saw labelled.
 - **Several ideas that looked better on the (corrected) holdout did not transfer** (section B).
-  The cross-encoder did: it only reads the two records' text, while the features that failed
-  looked at other records.
+  Both cross-encoders did. They bring in new information from the text itself, while most of the
+  ideas that failed only re-weighted signals the model already had.
 
 With more time, we would validate on the corrected split from the start, train the
 cross-encoder longer (more data kept helping), and work on records without an address.
@@ -338,25 +342,25 @@ external data, APIs or lookups are used. Word maps are hand-written; the diction
 from the provided training data only.
 
 ### B. Additional Results
-Experiments after the submitted model. Each one was checked on the leaderboard at the same number
-of matches as the submission, unless noted.
+What else we tried after the first cascade submission. Leaderboard checks used the same number of
+matches as our best submission at the time, unless noted.
 
 | Experiment | Local evidence | Leaderboard |
 |---|---|---|
 | Separate lenient threshold for records without an address | holdout +0.0020 | 0.9776 (worse) |
-| Stricter threshold for France (0.95) | – | 0.9792 (worse) |
+| Stricter threshold for France (0.95) | none (France is not in train) | 0.9792 (worse) |
 | Word-level features (typo vs replaced word, legal form, digit edits) + "twin" features | corrected holdout +0.0019 | 0.9749 (worse): on test it accepted same-name records with a different house number |
 | Per-cell thresholds from a train/test density-ratio estimate (by house-number agreement) | estimated gain | 0.9784 (worse): most likely because France, absent from the holdout, looked like "excess" in the estimate |
 | Non-matching records weighted 2x in training | corrected holdout +0.0007 | used in the final model (`--neg_weight 2`) |
-| Fine-tuned cross-encoder (MiniLM-L6, Apache-2.0) on the 1.4M uncertain test pairs, stacked with the cascade | corrected holdout +0.0022 at every threshold (AUC 0.939 → 0.958 on uncertain pairs) | 0.9808 (better) |
-| Multilingual cross-encoder (bge-reranker-base, MIT) on every candidate, as features of the final LightGBM (**submitted**) | corrected holdout 0.9872 → 0.9918; test-density estimate 0.9858 → 0.9914 | **0.9850** |
-| Synthetic decoys to simulate test density | could not reproduce the leaderboard's behaviour | – |
+| Fine-tuned cross-encoder (MiniLM-L6, Apache-2.0) on the 1.4M uncertain test pairs, stacked with the cascade | corrected holdout +0.0022 at every threshold (AUC 0.939 to 0.958 on uncertain pairs) | 0.9808 (better) |
+| Multilingual cross-encoder (bge-reranker-base, MIT) on every candidate, as features of the final LightGBM (**submitted**) | corrected holdout 0.9872 to 0.9918; test-density estimate 0.9858 to 0.9914 | **0.9850** |
+| Synthetic decoys to simulate test density | could not reproduce the leaderboard's behaviour | not submitted |
 
-Run times on AWS r6i.4xlarge:
+Run times (AWS r6i.4xlarge for the CPU steps, g5.2xlarge for the GPU steps):
 - key blocking ~16 min per split; TF-IDF ~86 min (train)
 - features for all 284M train pairs ~22 min
 - filter model ~20 min; final model ~6 min
-- test features + scoring ~1.5–2 h
+- test features + scoring ~1.5 to 2 h
 - small cross-encoder on CPU (16 vCPU): fine-tuning ~85 min, scoring 1.5M pairs ~95 min
 - multilingual cross-encoder on one A10G (AWS g5.2xlarge): ~720 pairs/s training (two models,
   ~3 h in total), ~3,000 pairs/s scoring (18.8M train + test pairs)
